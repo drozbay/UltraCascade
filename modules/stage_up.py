@@ -23,6 +23,12 @@ def ultracascade_reset_hook(func):
     @functools.wraps(func)
     def wrapper(self, *args, **kwargs):
         UltraCascadePatch.reset_sampling()
+        # Extract the sigmas tensor from the arguments (assuming it's the 4th positional argument)
+        sigmas_schedule = args[3] if len(args) > 3 else kwargs.get("sigmas", None)
+        if isinstance(sigmas_schedule, torch.Tensor) is False:
+            sigmas_schedule = None
+        if sigmas_schedule is not None:
+            UltraCascadePatch.set_sigmas_schedule(sigmas_schedule)
         return func(self, *args, **kwargs)
     return wrapper
 
@@ -32,9 +38,7 @@ comfy.samplers.CFGGuider.sample = ultracascade_reset_hook(original_sample)
 class UltraCascadePatch:
     current_step = 0
     basic_step = -1
-    x_lr = None
-    guide_weights = None
-    guide_type = 'residual'
+    sigmas_schedule = None
 
     @classmethod
     def reset_sampling(cls):
@@ -45,37 +49,61 @@ class UltraCascadePatch:
     def increment_basic_step(cls):
         cls.basic_step += 1
 
+    @classmethod
+    def set_sigmas_schedule(cls, sigmas_schedule):
+        cls.sigmas_schedule = sigmas_schedule
+
     def __init__(self, x_lr, guide_weights, guide_type):
         self.x_lr = x_lr
         self.guide_weights = guide_weights
+        self.guide_weights_tmp = None
         self.guide_type = guide_type
+        self.sigmas_schedule = None
+        self.sigmas_prev = None
         self.lr_guide = None
 
     def __call__(self, x, r, clip_text, clip_text_pooled, clip_img, extra_options):
         if self.x_lr is None:
-            return x
+                return x
+
         with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+            # Initialize or reset LR guide
             if self.lr_guide is None or self.__class__.current_step == 0:
                 self.lr_guide = None
                 self.__class__.current_step = 0
                 self.lr_guide = self.generate_lr_guide(x, r, clip_text, clip_text_pooled, clip_img, extra_options)
+                self.guide_weights_tmp = self.guide_weights if self.guide_weights is not None else None
+
+            # Determine guide weight
+            guide_weight = None
+            sigmas = extra_options.get('sigmas')
+            sigmas_schedule = self.__class__.sigmas_schedule
 
             if self.guide_weights is not None:
-                if self.__class__.basic_step >= 0:
-                    if self.__class__.basic_step < len(self.guide_weights):
-                        guide_weight = self.guide_weights[self.__class__.basic_step]
+                if sigmas_schedule is not None and sigmas is not None:
+                    # Use sigma-based schedule
+                    if len(self.guide_weights_tmp) == 0:
+                        guide_weight = self.guide_weights[-1]
+                    else:
+                        guide_weight = self.guide_weights_tmp[0]
+                        sigma_changed = (self.sigmas_prev is None or 
+                                        (self.sigmas_prev[0] != sigmas[0] and 
+                                        torch.isin(sigmas[0], sigmas_schedule.to(sigmas.device))))
+                        if sigma_changed:
+                            self.guide_weights_tmp = self.guide_weights_tmp[1:]
+                            
+                assert guide_weight is not None
+                if guide_weight is None: # If guide_weight is still None, use the the current_step
+                    if (len(self.guide_weights) > self.__class__.current_step):
+                        guide_weight = self.guide_weights[self.__class__.current_step]
                     else:
                         guide_weight = self.guide_weights[-1]
-                else:
-                    guide_weight = self.guide_weights[self.__class__.current_step]
             else:
                 guide_weight = r[0].item()
 
         self.__class__.current_step += 1
         
-        x = self.apply_guide(x, self.lr_guide, guide_weight, extra_options)
-
-        return x
+        return self.apply_guide(x, self.lr_guide, guide_weight, extra_options)
     
     def update(self, x_lr, guide_weights, guide_type, reset=True):
         if x_lr is not None:
@@ -93,6 +121,9 @@ class UltraCascadePatch:
         if reset:
             self.lr_guide = None
             self.__class__.basic_step = -1
+
+    def set_sigmas_prev(self, sigmas_prev):
+        self.sigmas_prev = sigmas_prev
 
     def generate_lr_guide(self, x, r, clip_text, clip_text_pooled, clip_img, extra_options):
         r_embed = extra_options['r_embed']
@@ -128,13 +159,13 @@ class UltraCascadePatch:
         r_embed = extra_options['model'].gen_r_embedding(extra_options['r']).to(dtype=x.dtype)
         for c in extra_options['model'].t_conds:
             t_cond = extra_options.get(c, torch.zeros_like(extra_options['r']))
-            r_embed = torch.cat([r_embed, extra_options['model'].gen_r_embedding(t_cond).to(dtype=x.dtype)], dim=1)        
+            r_embed = torch.cat([r_embed, extra_options['model'].gen_r_embedding(t_cond).to(dtype=x.dtype)], dim=1)
         clip = extra_options['model'].gen_c_embeddings(extra_options['clip_text'], extra_options['clip_text_pooled'], extra_options['clip_img'])
         
         level_outputs = extra_options['model']._down_encode(
-            x, r_embed, clip, cnet, 
-            require_q=False, 
-            r_emb_lite=extra_options['model'].gen_r_embedding(extra_options['r']),  
+            x, r_embed, clip, cnet,
+            require_q=False,
+            r_emb_lite=extra_options['model'].gen_r_embedding(extra_options['r']),
             guide_weight=guide_weight,
             guide_mode_weighted=guide_mode_weighted,
             lr_guide=lr_guide[0] if lr_guide is not None else None,
@@ -142,8 +173,8 @@ class UltraCascadePatch:
         )
 
         x = extra_options['model']._up_decode(
-            level_outputs, r_embed, clip, cnet, 
-            require_ff=False, 
+            level_outputs, r_embed, clip, cnet,
+            require_ff=False,
             r_emb_lite=extra_options['model'].gen_r_embedding(extra_options['r']), 
             guide_weight=guide_weight,
             guide_mode_weighted=guide_mode_weighted,
@@ -355,6 +386,7 @@ class StageUP(StageC):
 
 
     def forward(self, x, r, clip_text, clip_text_pooled, clip_img, control=None, **kwargs):
+        sigmas = kwargs.get("transformer_options", {}).get("sigmas")
         to = kwargs.get("transformer_options", {}).copy()
         patch = to.get("patches_replace", {}).get("ultracascade", {}).get("main", None)
 
@@ -391,13 +423,14 @@ class StageUP(StageC):
                     'sigmas': to.get('sigmas', torch.tensor([999999999.9])),
                     'pag_patch_flag': pag_patch_flag,
                     'sag_func': sag_func,
+                    'sigmas': sigmas,
                 }
                 x = patch(x, r, clip_text, clip_text_pooled, clip_img, extra_options)
             else:
                 level_outputs = self._down_encode(x, r_embed, clip, cnet, pag_patch_flag=pag_patch_flag)
                 x = self._up_decode(level_outputs, r_embed, clip, cnet, pag_patch_flag=pag_patch_flag, sag_func=sag_func)
 
-            if x.dtype == torch.float32:
-                x = x.to(torch.bfloat16)
-        
+        if patch is not None:
+            patch.set_sigmas_prev(sigmas_prev = sigmas[:1])
+
         return self.clf(x)
